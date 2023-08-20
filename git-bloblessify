@@ -154,7 +154,7 @@ bloblessify() {
   mission_complete=1
 
   size_after=$(du -sk "$git_dir"/objects | cut -f1)
-  printf '\n%s/objects size decreased by %s KB\n' "$dir/$git_dir" "$((size_before - size_after))"
+  printf "\n%s/objects size decreased by %'d KB\\n" "$dir/$git_dir" "$((size_before - size_after))"
 }
 
 main () {
