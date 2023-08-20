@@ -1,0 +1,172 @@
+#!/bin/bash
+
+# Convert a repository to "blobless clone"
+# Background reading: https://github.blog/2020-12-21-get-up-to-speed-with-partial-clone-and-shallow-clone/
+
+# Limitations: only operates on a single remote - the fetch remote of the current branch
+
+set -euo pipefail
+shopt -s failglob
+
+script_name=$(basename "$0")
+warn() { printf "%s: %s\n" "$script_name" "$*" >&2; }
+die () { warn "$@"; exit 1; }
+
+# This function will be called on clean exit, error exit and interrupt (eg ^C)
+cleanup() {
+  err=$?  # In case of ERR trap, save last command's exit status to use later on
+  trap '' EXIT HUP INT TERM  # Prevent recursive trap
+  set +eu  # Don't die because of errors - do as much clean up as possible
+  [ -d "$tmp_dir" ] && rm -rf "$tmp_dir"
+  if [ "${mission_complete:-}" ]; then
+    rm -rf "$backup_obj_dir"
+  elif [ -d "$backup_obj_dir" ]; then
+    # Something went wrong, restore previous state
+    rm -rf "$git_dir"/objects
+    mv "$backup_obj_dir" "$git_dir"/objects
+    warn 'previous git objects have been restored due to premature exit'
+    warn 'check config is correct:\n'
+    git config --local --list | grep 'remote\.'"${remote:-}"
+  else
+    die 'Something went wrong, but backup objects dir does not exist'
+  fi
+  if [[ $err -ne 0 ]]; then
+    warn "Exiting with error code: $err"
+  fi
+  exit "$err"
+}
+
+check_not_detached_head () {
+  if [ "$(git rev-parse --abbrev-ref --symbolic-full-name HEAD)" == 'HEAD' ]; then
+    die 'cannot operate on detached HEAD: branch is needed to determine fetch remote'
+  fi
+}
+
+get_git_dir() {
+  local dir=$1
+  git_dir=$(git rev-parse --git-dir 2>/dev/null) || die "$dir is not part of a git repo"
+}
+
+setup_blobless_config() {
+  remote=$1
+  # Setup `clone --filter=blob:none` config on remote
+  git config remote."$remote".promisor true
+  git config remote."$remote".partialclonefilter blob:none
+}
+
+# Returns 0 iff there are missing objects - eg repo is already blobless
+does_have_missing_objects() {
+  local err
+  set +o pipefail  # grep -q will close the pipe early, pipefail will catch SIGPIPE and an exit status of 141
+  git rev-list --objects --indexed-objects --no-object-names --missing=print --all | grep -Eq '^\?'
+  err=$?
+  set -o pipefail
+  return "$err"
+}
+
+bloblessify() {
+  dir=$1
+  cd "$dir"
+  check_not_detached_head
+  get_git_dir "$dir"
+
+  printf 'Running git fsck before proceeding...\n'
+  # shellcheck disable=SC2016  # Expressions don't expand in single quotes
+  git fsck || die 'repo does not pass `git fsck` check'
+
+  # Get the size of the git objects directory before we do anything
+  size_before=$(du -sk "$git_dir"/objects | cut -f1)
+
+  trap cleanup EXIT HUP INT TERM
+  tmp_dir=$(mktemp --directory --tmpdir "$script_name.XXXXX")
+
+  # Create a backup of the objects dir to restore should something go awry
+  backup_obj_dir="$git_dir/objects.bak.bloblessify-$$"
+  cp -a "$git_dir"/objects "$backup_obj_dir"
+
+  remote=$(git config branch."$(git rev-parse --abbrev-ref HEAD)".remote)
+  remote_url=$(git config --get remote."$remote".url)
+
+  # Clone from the remote
+  # We don't use $git_dir/objects/info/http-alternates since the remote may not be a https variant.
+  # If ssh alternates were supported, we could avoid doing a local clone.
+  # In the usual case, the clone is fast as we reuse local blobs that we already have in $git_dir
+  # However all blobs may not be available if trying to bloblessify an already blobless repository
+  # We first check that all blobs are available - otherwise `git clone --reference` gives a fatal error
+  printf '\nCloning pristine remote repository...\n'
+  alternate="$tmp_dir/$remote"
+  clone_cmd=( git clone --bare --dissociate "$remote_url" "$alternate" )
+  if does_have_missing_objects; then
+    printf 'Local git directory has missing local objects - this may already be a blobless repo.\n'
+  else
+    clone_cmd+=( --reference "$git_dir" )
+  fi
+  # Run the clone command contained in the array
+  "${clone_cmd[@]}"
+
+  # Add our fresh clone as an alternate
+  orig_alternates=${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}
+  export GIT_ALTERNATE_OBJECT_DIRECTORIES=${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}:$alternate/objects
+  # echo "export GIT_ALTERNATE_OBJECT_DIRECTORIES=${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}"
+
+  # Repack local-only objects -- remove those that exist in the freshly-cloned alternate
+  printf '\nRemoving objects that exist in the remote repository...\n'
+  git repack -adlf
+
+  # Reset GIT_ALTERNATE_OBJECT_DIRECTORIES so that git rev-list works correctly later
+  GIT_ALTERNATE_OBJECT_DIRECTORIES=$orig_alternates
+
+  # Set config for $remote as if it were initially cloned as blobless
+  setup_blobless_config "$remote"
+
+  # Fetch current HEAD's trees
+  #
+  # It would be nice to use the alternate clone as fetch source, but there is the error:
+  # error: /tmp/git-bloblessify.iLPs5/origin did not send all necessary objects
+  # It seems that the only (ugly) way would be to change the current branch's upstream, and then:
+  #
+  # # Setup fresh cloned, alternate repository as a remote for faster fetching of missing objects
+  # alternate_remote_name=bloblessify-$$  # Add PID for uniqueness
+  # git remote add "$alternate_remote_name" "$alternate"
+  # setup_blobless_config "$alternate_remote_name"
+  # # Configure the cloned alternate to support filtering for fetching
+  # (cd "$alternate" && pwd && git config --add uploadpack.allowFilter true)
+  # later:  git remote delete "$alternate_remote_name"
+  #
+  # Instead, we just pull the small amount of data from the remote
+
+  printf "\nFetching tags and HEAD's trees...\n"
+  git fetch --refetch --tags --no-auto-gc
+
+  # Fetch any objects that are missing - by default only the top directory files' objects exist
+  if git rev-list --objects --indexed-objects --no-object-names --missing=print --no-walk HEAD |
+    grep -E '^\?' | sed 's/^\?//g' | sort > "$alternate"/objects-required; then
+    printf '\nFetching required blobs for HEAD...\n'
+    git fetch-pack --refetch --thin --keep --stdin "$alternate" <"$alternate"/objects-required >/dev/null
+  else
+    printf 'No missing objects need to be fetched - repo was likely already blobless.\n'
+  fi
+
+  printf '\nChecking final state with fsck...\n'
+  git fsck || die 'fsck failed'
+
+  # If we get to here, we've done our job.  cleanup() will be called at exit, and act on the following flag:
+  mission_complete=1
+
+  size_after=$(du -sk "$git_dir"/objects | cut -f1)
+  printf '\n%s/objects size decreased by %s KB\n' "$dir/$git_dir" "$((size_before - size_after))"
+}
+
+main () {
+  if [ $# -eq 0 ]; then
+    bloblessify "."
+   else
+    # Bloblessify all the arguments on the command line
+    for dir in "$@"; do
+      [ -d "$dir" ] || die "$dir is not a directory"
+      bloblessify "$dir"
+    done
+  fi
+}
+
+main "$@"
