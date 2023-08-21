@@ -64,6 +64,17 @@ does_have_missing_objects() {
   return "$err"
 }
 
+# Set $remote to a single remote name
+set_remote_name () {
+  # If there is only one remote configured, use it (allows usage on bare repositories)
+  if [ "$(git remote | wc -l)" -eq 1 ]; then
+    remote=$(git remote)
+   return
+  else
+    remote=$(git config branch."$(git rev-parse --abbrev-ref HEAD)".remote) || die 'cannot get remote for HEAD'
+  fi
+}
+
 bloblessify() {
   dir=$1
   cd "$dir"
