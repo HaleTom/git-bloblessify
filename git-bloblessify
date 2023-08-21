@@ -130,7 +130,7 @@ bloblessify() {
 
   # Repack local-only objects -- remove those that exist in the freshly-cloned alternate
   printf '\nRemoving objects that exist in the remote repository...\n'
-  git repack -adlf
+  git repack -Adfl
 
   # Reset GIT_ALTERNATE_OBJECT_DIRECTORIES so that git rev-list works correctly later
   GIT_ALTERNATE_OBJECT_DIRECTORIES=$orig_alternates
