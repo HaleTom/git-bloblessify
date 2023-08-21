@@ -77,6 +77,12 @@ set_remote_name () {
   fi
 }
 
+git_fsck() {
+  # Hide dangling blobs as these are created as a "normal" part of git's operations
+  # Eg: a staged commit didn't get commited
+  git fsck --no-dangling
+}
+
 bloblessify() {
   dir=$1
   cd "$dir"
@@ -85,7 +91,7 @@ bloblessify() {
 
   printf 'Running git fsck before proceeding...\n'
   # shellcheck disable=SC2016  # Expressions don't expand in single quotes
-  git fsck || die 'repo does not pass `git fsck` check'
+  git_fsck || die 'repo does not pass `git fsck` check'
 
   # Get the size of the git objects directory before we do anything
   size_before=$(du -sk "$git_dir"/objects | cut -f1)
@@ -161,7 +167,7 @@ bloblessify() {
   fi
 
   printf '\nChecking final state with fsck...\n'
-  git fsck || die 'fsck failed'
+  git_fsck || die 'fsck failed'
 
   # If we get to here, we've done our job.  cleanup() will be called at exit, and act on the following flag:
   mission_complete=1
